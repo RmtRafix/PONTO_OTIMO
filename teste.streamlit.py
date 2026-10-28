@@ -3,7 +3,9 @@ import pandas as pd
 from datetime import datetime, timedelta
 from ortools.sat.python import cp_model
 
-
+# ==========================================
+# 1. TABELAS DE DOMÍNIO
+# ==========================================
 TABELA_SEG_SEX = {
     'A': ('06:00', '21:00'), 'B': ('06:00', '22:00'), 'C': ('06:00', '23:00'),
     'D': ('06:30', '21:00'), 'E': ('06:30', '22:00'), 'F': ('06:40', '20:00'),
@@ -34,20 +36,49 @@ def decodificar_classificacao(classificacao):
         'Domingo': TABELA_DOMINGO[c_dom]
     }
 
+# ==========================================
+# 2. CÁLCULO DINÂMICO DE HORAS (NOVA LÓGICA)
+# ==========================================
+def calcular_horas_trabalho_fds(horario_loja):
+    """Calcula o tempo de janela e trabalho efetivo no FDS, sem estourar o tamanho da loja."""
+    formato = "%H:%M"
+    abertura = datetime.strptime(horario_loja[0], formato)
+    fechamento = datetime.strptime(horario_loja[1], formato)
+    duracao_loja = (fechamento - abertura).total_seconds() / 3600.0
+    
+    if duracao_loja <= 6.25: 
+        # Turnos curtos (ex: Domingo 6h). O funcionário trabalha a janela inteira.
+        return duracao_loja, duracao_loja 
+    elif duracao_loja < 9.4:
+        # Loja abre menos que 9h24m, se adapta à loja, reduzindo o efetivo para abater 1h de almoço
+        return duracao_loja - 1.0, duracao_loja 
+    else:
+        # Padrão normal 8h24 de trabalho + 1h de almoço
+        return 8.4, 9.4 
 
-def calcular_horarios_turnos(horario_abertura, horario_fechamento):
-
+def calcular_horarios_turnos(horario_abertura, horario_fechamento, janela_turno_horas):
+    """Gera o texto das strings de horas distribuindo a janela dinamicamente"""
     formato = "%H:%M"
     abertura = datetime.strptime(horario_abertura, formato)
     fechamento = datetime.strptime(horario_fechamento, formato)
-    jornada = timedelta(hours=9, minutes=24)
     
+    # Converte horas decimais (ex: 10.2) para horas e minutos exatos (10h12m)
+    horas = int(janela_turno_horas)
+    minutos = int(round((janela_turno_horas - horas) * 60))
+    jornada = timedelta(hours=horas, minutes=minutos)
+    
+    # Trava de segurança final para nunca passar do horário da loja
+    duracao_loja = fechamento - abertura
+    if jornada > duracao_loja:
+        jornada = duracao_loja
+        
     t1_inicio = abertura
     t1_fim = t1_inicio + jornada
     
     t3_fim = fechamento
     t3_inicio = t3_fim - jornada
     
+    # Se for uma loja muito curta e t3 iniciar antes de t1, ajusta o meio termo
     meio_tempo = (t3_inicio - t1_inicio) / 2
     t2_inicio = t1_inicio + meio_tempo
     t2_fim = t2_inicio + jornada
@@ -58,7 +89,9 @@ def calcular_horarios_turnos(horario_abertura, horario_fechamento):
         'T3': f"{t3_inicio.strftime(formato)} às {t3_fim.strftime(formato)}"
     }
 
-
+# ==========================================
+# 3. MOTOR DE OTIMIZAÇÃO (OR-TOOLS)
+# ==========================================
 def gerar_escala_filial(id_loja, classificacao, qtd_balconistas, min_simultaneos, dia_pico, turno_pico):
     horarios_loja = decodificar_classificacao(classificacao)
     dias_semana = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
@@ -103,93 +136,75 @@ def gerar_escala_filial(id_loja, classificacao, qtd_balconistas, min_simultaneos
         escala = []
         for b in balconistas:
             linha = {'Loja': id_loja, 'Classificação': classificacao, 'Balconista': b}
+            
+            # 1. Mapeia todos os dias que o funcionário trabalha
+            dias_trabalhados = []
             for d in dias_semana:
-                horario_dia = horarios_loja[d]
-                
-                # Se a loja abre, calcula as horas reais daquele dia
-                mapa_horas = calcular_horarios_turnos(horario_dia[0], horario_dia[1]) if horario_dia else {}
-                
-                trabalhou = False
                 for t in turnos:
                     if solver.Value(x[(b, d, t)]) == 1:
-                        # Substitui T1/T2/T3 pela hora real gerada
-                        linha[d] = mapa_horas.get(t, t)
-                        trabalhou = True
-                if not trabalhou:
-                    linha[d] = 'FOLGA' if horario_dia is not None else 'FOLGA (Fechada)'
+                        dias_trabalhados.append({'dia': d, 'turno': t, 'horario_loja': horarios_loja[d]})
+                        break
+                        
+            # 2. Paga primeiro as horas do Final de Semana sem estourar a loja
+            horas_efetivas_fds = 0.0
+            dias_semana_trabalhados = 0
+            
+            for dt in dias_trabalhados:
+                if dt['dia'] in ['Sábado', 'Domingo']:
+                    trab_efetivo, janela = calcular_horas_trabalho_fds(dt['horario_loja'])
+                    horas_efetivas_fds += trab_efetivo
+                    dt['janela_turno'] = janela
+                else:
+                    dias_semana_trabalhados += 1
+                    
+            # 3. Distribui as horas restantes nas jornadas de Segunda a Sexta
+            horas_restantes = 42.0 - horas_efetivas_fds
+            if dias_semana_trabalhados > 0:
+                trab_efetivo_semana = horas_restantes / dias_semana_trabalhados
+                janela_semana = trab_efetivo_semana + 1.0 # Adiciona a 1h obrigatória de intervalo
+            else:
+                janela_semana = 9.4
+                
+            for dt in dias_trabalhados:
+                if dt['dia'] not in ['Sábado', 'Domingo']:
+                    dt['janela_turno'] = janela_semana
+                    
+            # 4. Constrói o texto das horas e aloca na linha do DataFrame
+            mapa_formatado = {}
+            for dt in dias_trabalhados:
+                turnos_horarios = calcular_horarios_turnos(dt['horario_loja'][0], dt['horario_loja'][1], dt['janela_turno'])
+                mapa_formatado[dt['dia']] = turnos_horarios[dt['turno']]
+                
+            for d in dias_semana:
+                if d in mapa_formatado:
+                    linha[d] = mapa_formatado[d]
+                else:
+                    linha[d] = 'FOLGA' if horarios_loja[d] is not None else 'FOLGA (Fechada)'
+                    
             escala.append(linha)
         return pd.DataFrame(escala)
     else:
         raise ValueError(f"Inviável matematicamente. Com {qtd_balconistas} balconistas e mínimo de {min_simultaneos} por turno, as regras de folga e cobertura não fecham.")
 
-
+# ==========================================
+# 4. INTERFACE STREAMLIT
+# ==========================================
 st.set_page_config(page_title="Gerador de Escala", layout="wide")
 
 st.title("Gerador de Escala Automático")
-st.markdown("Simulador e otimizador de escalas para as filiais, com horários dinâmicos.")
+st.markdown("Simulador e otimizador de escalas para as filiais, com balanço inteligente de horas aos domingos.")
 
-# SIDEBAR
 st.sidebar.header("Parâmetros da Loja")
-id_loja_class = {
-                1:'HEH',
-                2:'FCA',
-                3:'BAB',
-                4:'IGF',
-                5:'HEJ',
-                6:'JHG',
-                7:'IGF',
-                8:'IGK',
-                11:'EFL',
-                12:'ADK',
-                13:'HFA',
-                14:'HDA',
-                15:'DDA',
-                16:'HFA',
-                17:'HDA',
-                18:'IGF',
-                19:'CBC',
-                21:'DDA',
-                22:'GDA',
-                23:'HDH',
-                24:'HDA',
-                25:'IGF',
-                26:'DDA',
-                27:'IGF',
-                28:'HDA',
-                29:'IGF',
-                30:'DEA',
-                31:'IGD',
-                32:'HFL',
-                33:'ADA',
-                34:'IGF',
-                35:'HDI',
-                36:'IGE',
-                37:'HFE',
-                38:'HFK',
-                39:'DDA',
-                40:'IGF',
-                41:'IGF',
-                42:'DDK',
-                43:'HEH',
-                44:'HDA'
-                }
 
-id_loja = st.sidebar.selectbox("Filial", id_loja_class)
+id_loja = st.sidebar.selectbox("ID da Loja", range(1, 45))
 
 opcoes_classificacao = ["HEH", "FCA", "BAB", "IGF", "HEJ", "JHG", "IGK", "EFL", 
                         "ADK", "HFA", "HDA", "DDA", "CBC", "GDA", "HDH", "DEA", 
                         "IGD", "HFL", "ADA", "HDI", "IGE", "HFE", "HFK", "DDK"]
+classificacao = st.sidebar.selectbox("Classificação de Horário", opcoes_classificacao)
 
-
-
-if id_loja_class[id_loja] == None:
-    classificacao = st.sidebar.selectbox("Classificação de Horário (Origem ETL)", opcoes_classificacao)
-else:
-    classificacao = id_loja_class[id_loja]
-    st.sidebar.text(f"Classificação: {classificacao}")
-
-qtd_balconistas = st.sidebar.selectbox("Balconistas Disponíveis", range(1, 21), index=4)
-min_simultaneos = st.sidebar.selectbox("Mínimo Simultâneo na Loja", range(1, 21), index=0)
+qtd_balconistas = st.sidebar.selectbox("Balconistas Disponíveis", range(1, 16), index=4)
+min_simultaneos = st.sidebar.selectbox("Mínimo Simultâneo na Loja", range(1, 6), index=0)
 
 dias_semana = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
 dia_pico = st.sidebar.selectbox("Dia de Pico (Origem ETL)", dias_semana, index=4)
@@ -199,24 +214,24 @@ turno_selecionado = st.sidebar.selectbox("Turno de Pico (Origem ETL)", list(opco
 turno_pico = opcoes_turno[turno_selecionado]
 
 if st.button("Gerar Escala Otimizada", type="primary"):
-    with st.spinner("Processando combinações e calculando horários..."):
+    with st.spinner("Compensando horas excedentes nos turnos e gerando..."):
         try:
             df_escala = gerar_escala_filial(
                 id_loja, classificacao, qtd_balconistas, min_simultaneos, dia_pico, turno_pico
             )
             
-            st.success("Escala gerada com sucesso!")
+            st.success("Escala gerada com sucesso! Turnos aos domingos balanceados.")
             
             def colorir_tabela(val):
                 if isinstance(val, str):
                     if "FOLGA" in val:
                         return 'background-color: #c6e0b4; color: #000'
-                    elif "às" in val:
+                    elif "às" in val:  
                         return 'background-color: #fff2cc; color: #000'
                 return ''
 
             styled_df = df_escala.style.map(colorir_tabela, subset=dias_semana)
-            st.dataframe(styled_df, width='stretch', hide_index=True)
+            st.dataframe(styled_df, use_container_width=True, hide_index=True)
             
         except ValueError as erro:
             st.error(f"**Falha na geração:** {erro}")
